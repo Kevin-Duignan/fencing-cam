@@ -1,84 +1,155 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
-
 warnings.simplefilter("ignore")
 
 import cv2
 import torch
 import numpy as np
-from sort.sort import Sort  # From the public SORT repo
+from sort.sort import Sort
+import socket
+import time
 
-# Load YOLOv5 model
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s')  # Using the small model for faster detection
+# --- WiFi TCP connection to ESP32 ---
+ESP32_HOST = "esp32.local"  # mDNS hostname
+ESP32_PORT = 12345
 
-# Open video or webcam
-cap = cv2.VideoCapture('videoplayback.mp4')  # Replace with 0 for webcam
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-# Ensure video opens
+
+# Retry until connection succeeds
+while True:
+    try:
+        print("Connecting to ESP32...")
+        s.connect((ESP32_HOST, ESP32_PORT))
+        print("✅ Connected to ESP32 over WiFi")
+        break
+    except Exception as e:
+        print("❌ Connection failed, retrying in 2s:", e)
+        time.sleep(2)
+
+# --- Load YOLOv5 ---
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s')
+
+cap = cv2.VideoCapture(0)
 if not cap.isOpened():
-    # print("Error: Could not open video file.")
+    print("❌ Could not open video source")
     exit()
 
-# Initialize SORT tracker
 tracker = Sort()
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        # print("Error: Failed to read frame.")
-        break
+# --- Servo Control Parameters ---
+max_angle = 180
+min_angle = 0
+k_p = 0.2
+k_d = 0.05
+deadzone = 10
+max_step = 5
+current_servo_angle = 90
+previous_error = 0
 
-    # Perform YOLO detection
-    results = model(frame)  # Apply YOLOv5 model
-    detections = results.xywh[0].cpu().numpy()  # Extract detected boxes (x, y, width, height) as numpy array
-    # print("YOLOv5 detections:", detections)  # Debug output to check detections
+# --- Helper functions ---
+def process_trackers(frame, trackers):
+    midpoints_x = []
+    for track in trackers:
+        track_id = int(track[4])
+        x1, y1, x2, y2 = map(int, track[:4])
+        x_mid = (x1 + x2) // 2
+        midpoints_x.append(x_mid)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f'ID: {track_id}', (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return midpoints_x
 
-    boxes = []
-    for det in detections:
-        confidence = det[4]
-        class_id = int(det[5])  # Class ID of the detected object
-        if confidence > 0.5 and class_id == 0:  # Class ID 0 is 'person'
-            x, y, w, h = map(int, det[:4])  # Convert to integers
-            x1, y1 = int(x - w / 2), int(y - h / 2)  # Calculate x1, y1 (top-left)
-            x2, y2 = int(x + w / 2), int(y + h / 2)  # Calculate x2, y2 (bottom-right)
-            boxes.append([x1, y1, x2, y2, confidence])  # Append box with confidence
+def update_servo(target_x, frame_width):
+    global current_servo_angle, previous_error
+    frame_center = frame_width // 2
+    error = frame_center - target_x
 
-    # Perform tracking using SORT
-    if len(boxes) > 0:
-        np_boxes = np.array(boxes)
-        trackers = tracker.update(np_boxes)
-        # print("Trackers:", trackers)  # Debug output to check tracker results
+    if abs(error) > deadzone:
+        derivative = error - previous_error
+        delta_angle = int(k_p * error + k_d * derivative)
+        delta_angle = max(-max_step, min(max_step, delta_angle))
 
-        # Store the horizontal midpoints of the boxes for drawing the vertical line
-        midpoints_x = []
+        current_servo_angle += delta_angle
+        current_servo_angle = max(min_angle, min(max_angle, current_servo_angle))
 
-        # Draw tracking boxes and calculate midpoints
-        for track in trackers:
-            track_id = int(track[4])  # Extract the track ID
-            x1, y1, x2, y2 = map(int, track[:4])
+        # Send angle to ESP32
+        s.sendall(f"{current_servo_angle}\n".encode())
 
-            # Calculate horizontal midpoint for each detected box (ignoring y values)
-            x_mid = (x1 + x2) // 2
-            midpoints_x.append(x_mid)
+    previous_error = error
 
-            # Draw bounding box and track ID
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f'ID: {track_id}', (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+# --- Tracking functions ---
+def track_single_person():
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # If we have exactly two midpoints, draw a vertical line between them
-        if len(midpoints_x) == 2:
-            x1 = midpoints_x[0]  # Horizontal midpoint of the first fencer
-            x2 = midpoints_x[1]  # Horizontal midpoint of the second fencer
+        results = model(frame)
+        detections = results.xywh[0].cpu().numpy()
+        boxes = []
+        for det in detections:
+            confidence = det[4]
+            class_id = int(det[5])
+            if confidence > 0.5 and class_id == 0:  # Person
+                x, y, w, h = map(int, det[:4])
+                x1, y1 = int(x - w/2), int(y - h/2)
+                x2, y2 = int(x + w/2), int(y + h/2)
+                boxes.append([x1, y1, x2, y2, confidence])
 
-            # Draw a vertical line at the average x position of both midpoints
-            x_midline = (x1 + x2) // 2  # Average of both midpoints to get a line in the middle
-            cv2.line(frame, (x_midline, 0), (x_midline, frame.shape[0]), (0, 0, 255), 2)  # Red vertical line
+        if boxes:
+            trackers_array = tracker.update(np.array(boxes))
+            midpoints_x = process_trackers(frame, trackers_array)
+            if midpoints_x:
+                x_mid = midpoints_x[0]
+                update_servo(x_mid, frame.shape[1])
 
-    # Display the frame
-    cv2.imshow("Tracking", frame)
+        cv2.imshow("Single Person Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    cap.release()
+    cv2.destroyAllWindows()
 
-cap.release()
-cv2.destroyAllWindows()
+def track_fencers():
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model(frame)
+        detections = results.xywh[0].cpu().numpy()
+        boxes = []
+        for det in detections:
+            confidence = det[4]
+            class_id = int(det[5])
+            if confidence > 0.5 and class_id == 0:
+                x, y, w, h = map(int, det[:4])
+                x1, y1 = int(x - w/2), int(y - h/2)
+                x2, y2 = int(x + w/2), int(y + h/2)
+                boxes.append([x1, y1, x2, y2, confidence])
+
+        if boxes:
+            trackers_array = tracker.update(np.array(boxes))
+            midpoints_x = process_trackers(frame, trackers_array)
+            if len(midpoints_x) >= 2:
+                x1, x2 = midpoints_x[:2]
+                x_midline = (x1 + x2) // 2
+                update_servo(x_midline, frame.shape[1])
+
+        cv2.imshow("Fencers Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# --- Main ---
+if __name__ == "__main__":
+    mode = input("Select mode: [1] Single Person, [2] Fencers: ")
+    if mode == "1":
+        track_single_person()
+    elif mode == "2":
+        track_fencers()
+    else:
+        print("Invalid selection")
