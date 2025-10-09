@@ -144,27 +144,31 @@ time.sleep(0.5)
 # -----------------------------
 # Servo PID with Kalman filter
 # -----------------------------
+SERVO_INVERTED = True  # Set to True if servo rotates opposite direction
+
 class ServoController:
     def __init__(self):
         self.current_angle = 90
         self.previous_error = 0
         self.integral = 0
-        self.history = deque(maxlen=5)
+        self.history = deque(maxlen=5)  # Much longer history for heavy smoothing
+        self.angle_history = deque(maxlen=10)  # Track desired angles
         
-        # PID gains
-        self.k_p = 0.20
-        self.k_i = 0.005
-        self.k_d = 0.08
-        self.deadzone = 8
-        self.max_step = 6
+        # PID gains (tuned for smooth, stable tracking)
+        self.k_p = 0.06  # Very gentle proportional response
+        self.k_i = 0.0  # Disabled integral to prevent drift
+        self.k_d = 0.2  # Strong damping to prevent oscillation
+        self.deadzone = 40  # Large deadzone - only move if significantly off-center
+        self.max_step = 3  # Very small steps for smooth motion
+        self.min_angle_change = 2  # Minimum angle change to actually send command
         
         # Simple Kalman filter for position smoothing
-        self.kalman_gain = 0.3
+        self.kalman_gain = 0.5
         self.estimated_pos = None
         self.estimation_error = 1.0
         
         self.last_command_time = 0
-        self.min_command_interval = 0.03  # 30ms between commands
+        self.min_command_interval = 0.05  # 50ms between commands (slower updates)
     
     def kalman_update(self, measurement):
         """Simple 1D Kalman filter"""
@@ -191,7 +195,11 @@ class ServoController:
         smoothed_target = int(np.mean(self.history))
         
         # PID control
-        error = frame_width // 2 - smoothed_target
+        error = smoothed_target - frame_width // 2
+        
+        # Invert error if servo is wired backwards
+        if SERVO_INVERTED:
+            error = -error
         
         if abs(error) > self.deadzone:
             self.integral = np.clip(self.integral + error, -100, 100)
@@ -200,7 +208,11 @@ class ServoController:
             delta = int(self.k_p * error + self.k_i * self.integral + self.k_d * derivative)
             delta = np.clip(delta, -self.max_step, self.max_step)
             
-            new_angle = np.clip(self.current_angle + delta, 0, 180)
+            # new_angle = np.clip(self.current_angle + delta, 0, 180)
+            target_angle = np.clip(self.current_angle + delta, 0, 180)
+            # Smoothly interpolate 20% toward the target
+            new_angle = self.current_angle + 0.5 * (target_angle - self.current_angle)
+
             
             # Rate limiting
             current_time = time.time()
