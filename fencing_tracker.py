@@ -23,7 +23,8 @@ print(f"Using device: {device}")
 # -----------------------------
 # Load YOLOv5n model with optimizations
 # -----------------------------
-model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
+torch.cuda.empty_cache()
+model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True, device='cpu')
 model.to(device)
 model.eval()
 
