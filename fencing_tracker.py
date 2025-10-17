@@ -7,6 +7,8 @@ import warnings
 from collections import deque
 from threading import Thread, Lock
 import queue
+import gc
+gc.enable()  # Enable garbage collection
 
 # -----------------------------
 # Suppress warnings
@@ -24,22 +26,29 @@ print(f"Using device: {device}")
 # Load YOLOv5n model with optimizations
 # -----------------------------
 torch.cuda.empty_cache()
-model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True, device='cpu')
+model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
 model.to(device)
 model.eval()
+model.conf = 0.35  # Lower confidence threshold for better detection
+model.iou = 0.45   # Lower IoU threshold
+model.classes = [0]  # Only detect people class
+model.max_det = 10  # Limit maximum detections
 
 # Optimize model
 if device == 'cuda':
     model.half()  # FP16 for speed
     torch.backends.cudnn.benchmark = True  # Auto-tune convolutions
-
-# Compile model for faster inference (PyTorch 2.0+)
-# Disabled on Windows due to C++ compiler requirements
-# try:
-#     model = torch.compile(model, mode='reduce-overhead')
-#     print("✅ Model compiled with torch.compile")
-# except:
-#     print("ℹ️ torch.compile not available, using standard model")
+    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere
+    torch.backends.cudnn.allow_tf32 = True  # Allow TF32 on Ampere
+    torch.cuda.set_per_process_memory_fraction(0.8)  # Limit GPU memory usage
+    
+    # Try to enable TensorRT optimization
+    try:
+        print("Attempting TensorRT optimization...")
+        model = torch.jit.script(model)
+        print("✅ TensorRT optimization enabled")
+    except Exception as e:
+        print(f"ℹ️ TensorRT optimization not available: {e}")
 
 # -----------------------------
 # Resolve ESP32 hostname via mDNS
@@ -55,7 +64,8 @@ def resolve_mdns(hostname, port):
         print(f"⚠️ Could not resolve {hostname}: {e}")
         return None, None
 
-ESP32_IP, ESP32_PORT = resolve_mdns(ESP32_HOSTNAME, ESP32_PORT)
+#ESP32_IP, ESP32_PORT = resolve_mdns(ESP32_HOSTNAME, ESP32_PORT)
+ESP32_IP = "172.20.10.6"
 if ESP32_IP is None:
     print("❌ Could not resolve ESP32 hostname. Make sure your PC is on the same WiFi as ESP32.")
     exit()
@@ -65,6 +75,13 @@ sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's al
 try:
     sock.connect((ESP32_IP, ESP32_PORT))
     print(f"✅ Connected to ESP32 at {ESP32_IP}:{ESP32_PORT}")
+    
+    # Initialize servo to center position (90°)
+    time.sleep(0.1)  # Brief delay to ensure connection is stable
+    sock.sendall("90\n".encode())
+    print("🎯 Servo initialized to center position (90°)")
+    time.sleep(0.5)  # Give servo time to reach position
+    
 except Exception as e:
     print("❌ Could not connect to ESP32:", e)
     exit()
@@ -73,13 +90,15 @@ except Exception as e:
 # Camera setup with threading
 # -----------------------------
 class VideoCapture:
-    """Threaded video capture for reduced latency"""
+    """Threaded video capture with frame dropping for reduced latency"""
     def __init__(self, src=0, backend=cv2.CAP_MSMF):
         self.cap = cv2.VideoCapture(src, backend)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # Use MJPEG format
+        self.frame_count = 0  # Track frames for potential dropping
         
         self.q = queue.Queue(maxsize=2)
         self.lock = Lock()
@@ -93,19 +112,32 @@ class VideoCapture:
         self.thread.start()
     
     def _reader(self):
+        last_read_time = time.time()
+        min_frame_time = 1.0 / 30
+        
         while not self.stopped:
+            current_time = time.time()
+            elapsed = current_time - last_read_time
+            
+            if elapsed < min_frame_time:
+                time.sleep(0.001)
+                continue
+            
+            # Check if queue has space BEFORE reading
+            if self.q.full():
+                time.sleep(0.001)
+                continue
+                
+            last_read_time = current_time
             ret, frame = self.cap.read()
             if not ret:
                 continue
             
-            # Keep only latest frame
-            with self.lock:
-                if not self.q.empty():
-                    try:
-                        self.q.get_nowait()
-                    except queue.Empty:
-                        pass
-                self.q.put(frame)
+            # Simpler queue management
+            try:
+                self.q.put_nowait(frame)
+            except queue.Full:
+                pass
     
     def read(self):
         return self.q.get()
@@ -120,7 +152,7 @@ class VideoCapture:
 
 # Initialize camera
 cap = None
-camera_indices = [2, 1, 0]
+camera_indices = [1,2,3,4]
 backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_VFW]
 
 for idx in camera_indices:
@@ -137,13 +169,13 @@ for idx in camera_indices:
         break
 
 if cap is None:
-    print("❌ Could not open any camera. Make sure Iriun is running and connected.")
+    print("❌ Could not open any camera. ")
     exit()
 
 time.sleep(0.5)
 
 # -----------------------------
-# Servo PID with Kalman filter
+# Servo PID with Kalman filter and adaptive speed
 # -----------------------------
 SERVO_INVERTED = True  # Set to True if servo rotates opposite direction
 
@@ -155,12 +187,18 @@ class ServoController:
         self.history = deque(maxlen=5)  # Much longer history for heavy smoothing
         self.angle_history = deque(maxlen=10)  # Track desired angles
         
-        # PID gains (tuned for smooth, stable tracking)
-        self.k_p = 0.06  # Very gentle proportional response
+        # Base PID gains (will be scaled based on proximity)
+        self.k_p_base = 0.1  # Reduced from 0.06 for less aggressive response
         self.k_i = 0.0  # Disabled integral to prevent drift
-        self.k_d = 0.2  # Strong damping to prevent oscillation
-        self.deadzone = 40  # Large deadzone - only move if significantly off-center
-        self.max_step = 3  # Very small steps for smooth motion
+        self.k_d_base = 0.8  # Increased from 0.2 for more damping
+        self.deadzone_base = 10  # Increased from 40 to reduce jitter
+        self.max_step_base = 4  # Reduced from 3 for smoother movement
+        
+        # Adaptive parameters
+        self.k_p = self.k_p_base
+        self.k_d = self.k_d_base
+        self.deadzone = self.deadzone_base
+        self.max_step = self.max_step_base
         self.min_angle_change = 2  # Minimum angle change to actually send command
         
         # Simple Kalman filter for position smoothing
@@ -169,7 +207,7 @@ class ServoController:
         self.estimation_error = 1.0
         
         self.last_command_time = 0
-        self.min_command_interval = 0.05  # 50ms between commands (slower updates)
+        self.min_command_interval = 0.03  # 30ms between commands
     
     def kalman_update(self, measurement):
         """Simple 1D Kalman filter"""
@@ -187,7 +225,37 @@ class ServoController:
         
         return self.estimated_pos
     
-    def update(self, target_x, frame_width):
+    def adapt_speed_to_proximity(self, box_height, frame_height):
+        """Adjust movement speed based on detected person size (proximity indicator)"""
+        # Normalized size: larger box = closer person = faster movement needed
+        size_ratio = box_height / frame_height
+        
+        # Speed multiplier: reduced ranges to prevent overshooting
+        if size_ratio > 0.5:  # Very close
+            speed_multiplier = 2.0
+        elif size_ratio > 0.35:  # Close
+            speed_multiplier = 1.5
+        elif size_ratio > 0.25:  # Medium distance
+            speed_multiplier = 1.2
+        elif size_ratio > 0.15:  # Far
+            speed_multiplier = 1.0
+        else:  # Very far
+            speed_multiplier = 0.7
+        
+        # Apply multiplier to control parameters
+        self.k_p = self.k_p_base * speed_multiplier
+        self.k_d = self.k_d_base * speed_multiplier
+        self.max_step = int(self.max_step_base * speed_multiplier)
+        self.deadzone = max(25, int(self.deadzone_base / speed_multiplier))
+        
+        return speed_multiplier
+    
+    def update(self, target_x, frame_width, box_height=None, frame_height=480):
+        # Adapt speed based on proximity if box height is provided
+        speed_mult = 1.0
+        if box_height is not None and frame_height is not None:
+            speed_mult = self.adapt_speed_to_proximity(box_height, frame_height)
+        
         # Apply Kalman filter
         filtered_x = self.kalman_update(target_x)
         
@@ -209,18 +277,16 @@ class ServoController:
             delta = int(self.k_p * error + self.k_i * self.integral + self.k_d * derivative)
             delta = np.clip(delta, -self.max_step, self.max_step)
             
-            # new_angle = np.clip(self.current_angle + delta, 0, 180)
             target_angle = np.clip(self.current_angle + delta, 0, 180)
-            # Smoothly interpolate 20% toward the target
-            new_angle = self.current_angle + 0.5 * (target_angle - self.current_angle)
-
+            # Smoothly interpolate toward the target
+            new_angle = self.current_angle + 0.3 * (target_angle - self.current_angle)
             
             # Rate limiting
             current_time = time.time()
             if current_time - self.last_command_time >= self.min_command_interval:
                 if abs(new_angle - self.current_angle) > 0:
                     try:
-                        sock.sendall(f"{new_angle}\n".encode())
+                        sock.sendall(f"{int(new_angle)}\n".encode())
                         self.current_angle = new_angle
                         self.last_command_time = current_time
                     except Exception as e:
@@ -245,53 +311,85 @@ class FPSCounter:
             return len(self.timestamps) / (self.timestamps[-1] - self.timestamps[0])
         return 0
 
-def preprocess_frame(frame, target_size=(320, 320)):
-    """Efficient preprocessing with caching"""
-    # Resize once to target size
-    resized = cv2.resize(frame, target_size, interpolation=cv2.INTER_LINEAR)
-    # Convert color space
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    return rgb
+def preprocess_frame(frame, target_size=(224, 224)):
+    """More efficient preprocessing"""
+    # Skip frames if too large
+    if frame.shape[0] > 640 or frame.shape[1] > 640:
+        frame = cv2.resize(frame, (640, 480))
+    
+    # Use faster resize method
+    resized = cv2.resize(frame, target_size, interpolation=cv2.INTER_NEAREST)
+    return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
 def track_single_person(target_fps=30):
     fps_counter = FPSCounter()
     last_inference_time = 0
-    inference_interval = 1.0 / 15  # Run inference at 15 Hz max for balance
+    inference_interval = 1.0 / 30
     last_detection = None
+    detection_timeout = 0.5
+    last_detection_time = 0
+    last_gc_time = time.time()
+    gc_interval = 10.0
     
     try:
         while True:
             frame = cap.read()
             current_time = time.time()
             
+            # Periodic garbage collection
+            if current_time - last_gc_time > gc_interval:
+                gc.collect()
+                last_gc_time = current_time
+            
+            # Clear stale detection if too old
+            if last_detection is not None and (current_time - last_detection_time) > detection_timeout:
+                last_detection = None
+            
             # Inference throttling
             should_infer = (current_time - last_inference_time) >= inference_interval
             
             if should_infer:
-                img = preprocess_frame(frame, target_size=(320, 320))
+                img = preprocess_frame(frame, target_size=(224, 224))
+                
+                # Add warmup frames if no recent detection
+                if time.time() - last_detection_time > 1.0:
+                    with torch.no_grad():
+                        model(img, size=224)
+                        model(img, size=224)
                 
                 # YOLO inference
                 with torch.no_grad():
                     if device == 'cuda':
                         with torch.amp.autocast('cuda'):
-                            results = model(img, size=320)
+                            results = model(img, size=224)
                     else:
-                        results = model(img, size=320)
+                        results = model(img, size=224)
                 
-                detections = results.xyxy[0].cpu().numpy()
-                person_boxes = [d for d in detections if int(d[5]) == 0 and d[4] > 0.4]  # Confidence threshold
+                # Process detections more efficiently
+                detections = results.xyxy[0]
+                if device == 'cuda':
+                    detections = detections.cpu()
+                detections = detections.numpy()
                 
-                if person_boxes:
+                # Vectorized filtering for person class and confidence
+                mask = (detections[:, 5] == 0) & (detections[:, 4] > 0.4)
+                person_boxes = detections[mask]
+                
+                if person_boxes.shape[0] > 0:
                     # Track largest person
                     largest = max(person_boxes, key=lambda x: (x[2]-x[0])*(x[3]-x[1]))
                     last_detection = largest
+                    last_detection_time = current_time
                     
                     # Map back to original frame coordinates
                     scale_x = frame.shape[1] / 320
                     scale_y = frame.shape[0] / 320
                     cx = int((largest[0] + largest[2]) / 2 * scale_x)
+                    box_height = int((largest[3] - largest[1]) * scale_y)
                     
-                    servo_controller.update(cx, frame.shape[1])
+                    servo_controller.update(cx, frame.shape[1], box_height, frame.shape[0])
+                else:
+                    last_detection = None
                 
                 last_inference_time = current_time
             
@@ -314,10 +412,10 @@ def track_single_person(target_fps=30):
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
             fps = fps_counter.update()
-            cv2.putText(frame, f"FPS: {fps:.1f} | Servo: {servo_controller.current_angle}°", 
+            cv2.putText(frame, f"FPS: {fps:.1f} | Servo: {servo_controller.current_angle:.0f}°", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            cv2.imshow("Single Person Tracking", frame)
+            #cv2.imshow("Single Person Tracking", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
                 
@@ -331,10 +429,12 @@ def track_fencers(target_fps=30):
     last_inference_time = 0
     inference_interval = 1.0 / 15
     last_detections = None
+    detection_timeout = 0.5
+    last_detection_time = 0
     
     # Track the first two people detected and lock onto them
-    tracked_fencers = None  # Will store reference positions of the two fencers
-    fencer_lock_threshold = 100  # pixels - how far a person can move and still be considered the same
+    tracked_fencers = None
+    fencer_lock_threshold = 100
     
     def match_detection_to_tracked(detection, tracked_list):
         """Find which tracked fencer (if any) matches this detection"""
@@ -362,6 +462,10 @@ def track_fencers(target_fps=30):
             frame = cap.read()
             current_time = time.time()
             
+            # Clear stale detections if too old
+            if last_detections is not None and (current_time - last_detection_time) > detection_timeout:
+                last_detections = None
+            
             should_infer = (current_time - last_inference_time) >= inference_interval
             
             if should_infer:
@@ -379,7 +483,6 @@ def track_fencers(target_fps=30):
                 
                 # Initialize tracking with first two people detected
                 if tracked_fencers is None and len(person_boxes) >= 2:
-                    # Sort by x-coordinate and take leftmost and rightmost
                     person_boxes.sort(key=lambda x: (x[0]+x[2])/2)
                     tracked_fencers = [person_boxes[0], person_boxes[-1]]
                     last_detections = tracked_fencers.copy()
@@ -390,14 +493,12 @@ def track_fencers(target_fps=30):
                     updated_fencers = [None, None]
                     used_detections = set()
                     
-                    # Match current detections to tracked fencers
                     for detection in person_boxes:
                         match_idx = match_detection_to_tracked(detection, tracked_fencers)
                         if match_idx is not None and match_idx not in used_detections:
                             updated_fencers[match_idx] = detection
                             used_detections.add(match_idx)
                     
-                    # Update tracked positions (keep old position if not found)
                     for i in range(2):
                         if updated_fencers[i] is not None:
                             tracked_fencers[i] = updated_fencers[i]
@@ -405,13 +506,21 @@ def track_fencers(target_fps=30):
                     # Only update servo if we have both fencers
                     if updated_fencers[0] is not None and updated_fencers[1] is not None:
                         last_detections = [tracked_fencers[0], tracked_fencers[1]]
+                        last_detection_time = current_time
                         
                         scale_x = frame.shape[1] / 320
+                        scale_y = frame.shape[0] / 320
                         cx_left = int((tracked_fencers[0][0] + tracked_fencers[0][2]) / 2 * scale_x)
                         cx_right = int((tracked_fencers[1][0] + tracked_fencers[1][2]) / 2 * scale_x)
                         mid_x = (cx_left + cx_right) // 2
                         
-                        servo_controller.update(mid_x, frame.shape[1])
+                        height_left = int((tracked_fencers[0][3] - tracked_fencers[0][1]) * scale_y)
+                        height_right = int((tracked_fencers[1][3] - tracked_fencers[1][1]) * scale_y)
+                        avg_height = (height_left + height_right) // 2
+                        
+                        servo_controller.update(mid_x, frame.shape[1], avg_height, frame.shape[0])
+                    else:
+                        last_detections = None
                 
                 last_inference_time = current_time
             
@@ -428,13 +537,11 @@ def track_fencers(target_fps=30):
                     box_x2 = int(x2 * scale_x)
                     box_y2 = int(y2 * scale_y)
                     
-                    # Different colors for each fencer
                     color = (0, 255, 0) if idx == 0 else (255, 0, 255)
                     cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), color, 2)
                     cx = (box_x1 + box_x2) // 2
                     centers.append(cx)
                     
-                    # Label fencers
                     label = f"F{idx+1}: {conf:.2f}"
                     cv2.putText(frame, label, (box_x1, box_y1-5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -443,20 +550,19 @@ def track_fencers(target_fps=30):
                     mid_x = sum(centers) // len(centers)
                     cv2.line(frame, (mid_x, 0), (mid_x, frame.shape[0]), (0, 0, 255), 2)
             
-            # Display tracking status
             status = "🎯 LOCKED" if tracked_fencers is not None else "🔍 SEARCHING..."
             cv2.putText(frame, status, (10, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             fps = fps_counter.update()
-            cv2.putText(frame, f"FPS: {fps:.1f} | Servo: {servo_controller.current_angle}°", 
+            cv2.putText(frame, f"FPS: {fps:.1f} | Servo: {servo_controller.current_angle:.0f}°", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
             cv2.imshow("Fencers Tracking", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('r'):  # Press 'r' to reset tracking
+            elif key == ord('r'):
                 tracked_fencers = None
                 print("🔄 Tracking reset - searching for new fencers...")
                 
