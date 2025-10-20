@@ -64,8 +64,8 @@ def resolve_mdns(hostname, port):
         print(f"⚠️ Could not resolve {hostname}: {e}")
         return None, None
 
-#ESP32_IP, ESP32_PORT = resolve_mdns(ESP32_HOSTNAME, ESP32_PORT)
-ESP32_IP = "172.20.10.6"
+ESP32_IP, ESP32_PORT = resolve_mdns(ESP32_HOSTNAME, ESP32_PORT)
+#ESP32_IP = "172.20.10.6"
 if ESP32_IP is None:
     print("❌ Could not resolve ESP32 hostname. Make sure your PC is on the same WiFi as ESP32.")
     exit()
