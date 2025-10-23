@@ -152,6 +152,7 @@ class VideoCapture:
 
 # Initialize camera
 cap = None
+
 camera_indices = [1,2,3,4]
 backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_VFW]
 
@@ -415,7 +416,7 @@ def track_single_person(target_fps=30):
             cv2.putText(frame, f"FPS: {fps:.1f} | Servo: {servo_controller.current_angle:.0f}°", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            #cv2.imshow("Single Person Tracking", frame)
+            cv2.imshow("Single Person Tracking", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
                 
